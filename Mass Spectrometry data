@@ -1,0 +1,672 @@
+---
+title: "Mass Spectrometry data"
+author: "Ya-Ting Yang"
+date: "2025-03-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+start_time <- Sys.time()
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+# Set working directory
+setwd("C:/Users/user/OneDrive/桌面/251RBIF-112-2 Mathematical Modeling for Bioinformatics/Week 8/Week 8 Assignment")
+library(data.table)
+library(makeunique)
+library(dplyr)
+library(data.table)
+library(tidyr)
+library(DEP)
+library(SummarizedExperiment)
+library(EnrichmentBrowser)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(reshape2)
+library(VIM)
+library(reactome.db)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(msigdbr)
+library(dplyr)
+library(AnnotationDbi)
+# BiocManager::install("EnrichmentBrowser")
+options(warn = -1)
+```
+
+#### The data used in this coursework mainly comes from the article by Bressan, 2021. It focused on the highly malignant gliomas in human fetuses, and explained how H3.3 mutations affect the regional-specific neural progenitor cell state to drive the development of the disease. The study provided data from the following groups:
+#### 1. Control: Healthy human fetal neural stem cells
+#### 2. G34R (Forebrain): Disease group, with a mutation in the H3.3 protein where glycine 34 is changed to arginine
+#### 3. WT: Disease group, with the unmutated H3.3 protein
+#### However, since one of the replicates in the G34R disease group had over 80% missing values, I chose to analyze the Control and WT data.<br><br>
+
+
+# Problem 1
+
+
+```{r}
+# PXD021270
+# Read the proteomics data file
+data_original <- fread("proteinGroups.txt")
+
+# Select important columns and filter those containing "Intensity"
+data <- data_original[, c("Majority protein IDs", "Peptide counts (all)", 
+                          colnames(data_original)[grep("Intensity", colnames(data_original), ignore.case = TRUE)],
+                          "Protein names", "Gene names"), with = FALSE]
+
+# Add a new column to the data frame labeled "Plasma"
+data$Sample <- "Plasma"
+
+# Merge columns that do not contain "intensity" with those that contain "LFQ"
+data <- cbind(data[, !grepl("intensity", colnames(data), ignore.case = TRUE), with = FALSE],
+              data[, grepl("LFQ", colnames(data), ignore.case = TRUE), with = FALSE])
+
+# Rearrange the order of the columns
+data <- data[, c("Sample", "Majority protein IDs", "Gene names", "Protein names", 
+                  "Peptide counts (all)", colnames(data)[grepl("LFQ", colnames(data))]), with = FALSE]
+
+# Rename the first five columns
+setnames(data, colnames(data)[1:5], c("Sample", "ProteinID", "GeneSymbol", "Description", "Numberofpeptides"))
+
+# Calculate the number of peptides for each protein
+data$Numberofpeptides <- sapply(data$Numberofpeptides, function(x) {
+  sum(as.numeric(strsplit(x, ";")[[1]]))
+})
+
+# Remove columns containing "Liver_Rep"
+data <- data[, !grepl("Liver_Rep", colnames(data)), with = FALSE]
+
+# Remove columns containing "_Top14Top6Depl_"
+data <- data[, !grepl("_Top14Top6Depl_", colnames(data)), with = FALSE]
+
+# Remove columns containing "_Top6Top14Depl_"
+data <- data[, !grepl("_Top6Top14Depl_", colnames(data)), with = FALSE]
+
+# Remove rows where Numberofpeptides column is NA
+# data <- data[!is.na(data$Numberofpeptides), ]
+
+# Optionally remove rows where Numberofpeptides column is zero
+# data <- data[data$Numberofpeptides > 0, ]
+
+# Clean up column names by removing excess parts
+Cnames <- gsub("20170405.+_Human_", "", colnames(data))
+Cnames <- gsub("_F.+", "", Cnames)
+
+# Ensure column names are unique
+colnames(data) <- makeunique::make_unique(Cnames, "_", wrap_in_brackets = FALSE)
+
+# Extract the first ID for each protein
+data$ProteinID <- sapply(data$ProteinID, function(x) { strsplit(x, ";")[[1]][1] })
+data$GeneSymbol <- sapply(data$GeneSymbol, function(x) { strsplit(x, ";")[[1]][1] })
+data$Description <- sapply(data$Description, function(x) { strsplit(x, ";")[[1]][1] })
+
+# Are there any duplicated gene names?
+# data$GeneSymbol %>% duplicated() %>% any()
+
+# Make a table of duplicated gene names
+data %>% group_by(GeneSymbol) %>% summarize(frequency = n()) %>% 
+  arrange(desc(frequency)) %>% filter(frequency > 1)
+
+# Make unique names using the annotation in the "Gene.names" column as primary names and the annotation in "Protein.IDs" as names for those that do not have a gene name.
+data_unique <- make_unique(data, "GeneSymbol", "ProteinID", delim = ";")
+
+# Are there any duplicated names?
+# data$name %>% duplicated() %>% any()
+
+# library(data.table)
+
+# Delete columns 9, 10, and 11 (LFQ intensity P2D3-G34R-1, LFQ intensity P2D3-G34R-2, LFQ intensity P2D3-G34R-3, because the third replicate has more than 80% missing values)
+data <- data[, -c(9, 10, 11), with = FALSE]
+
+# Generate a SummarizedExperiment object using an experimental design
+LFQ_columns <- grep("LFQ.", colnames(data_unique)) # get LFQ column numbers
+
+# Define data
+label <- c("LFQ intensity CTL-1", "LFQ intensity CTL-2", "LFQ intensity CTL-3",
+            "LFQ intensity P2D3-WT-1", "LFQ intensity P2D3-WT-2", "LFQ intensity P2D3-WT-3")
+condition <- c("Control", "Control", "Control", "WT", "WT", "WT")
+replicate <- c(1, 2, 3, 1, 2, 3)
+
+# Create a data frame
+experimental_design <- data.frame(
+  label = label,
+  condition = condition,
+  replicate = replicate
+)
+
+data_se <- make_se(data_unique, LFQ_columns, experimental_design)
+
+# Generate a SummarizedExperiment object by parsing condition information from the column names
+# data_se_parsed <- make_se_parse(data_unique, LFQ_columns)
+
+# Let's have a look at the SummarizedExperiment object
+data_se
+
+# Extract the data matrix
+data_matrix <- assay(data_se)
+
+# Replace 0 values with NA
+data_matrix[data_matrix == 0] <- NA
+
+# Use KNN for imputation, ensuring only specific columns are imputed
+data_imputed <- kNN(data_matrix[, 1:6], variable = colnames(data_matrix)[1:6], k = 5)  # select only the first 6 columns
+
+# If data_imputed contains extra logical columns, select the numeric part
+data_imputed <- as.matrix(data_imputed[, 1:6])  
+# select only the numeric data from the first 6 columns
+
+# Place the imputed data back into the SummarizedExperiment object
+assay(data_se, withDimnames = FALSE) <- data_imputed
+
+# Confirm imputation results
+sum(is.na(assay(data_se)))
+
+# Normalize the data
+data_norm <- normalize_vsn(data_se)
+
+# Visualize normalization
+plot_normalization(data_se, data_norm)
+```
+
+#### Normalization makes the data distribution between samples more uniform.<br><br>
+
+
+```{r}
+# Test all possible comparisons of samples
+data_diff <- test_diff(data_norm, type = "all")
+
+# Denote significant proteins based on user-defined cutoffs
+dep <- add_rejections(data_diff, alpha = 0.05, lfc = log2(1.5))
+
+# Plot the first and second principal components
+plot_pca(dep, x = 1, y = 2, n = 150, point_size = 4)
+```
+
+#### This plot shows the principal component analysis (PCA) of top 150 variable proteins. The PC1 explains 65.3% of the variance, while the PC2 explains 21.4% of the variance and the distribution of samples in the plot shows the variation under different conditions, highlighting the differences between Control and WT.<br><br>
+
+
+```{r}
+# Plot the Pearson correlation matrix
+# plot_cor(dep, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+# Error: logical subscript contains NAs, but there's no NAs
+
+# Loose settings for finding significant proteins.
+dep <- add_rejections(data_diff, alpha = 0.5, lfc = log2(0.5))
+
+# Check row data
+rowdata <- rowData(dep)$significant
+head(rowdata)
+```
+
+#### I tried using very loose alpha and lfc values setting to find significant proteins, but I only got NAs. Therefore, I still used a t-test to find the top 150 significant proteins.<br><br>
+
+
+```{r}
+# Load necessary libraries
+# library(SummarizedExperiment)
+# library(dplyr)
+
+# Extract the expression matrix and metadata
+data_matrix <- assay(data_se)
+col_data <- colData(data_se)
+row_data <- data_unique$ProteinID
+
+
+# Prepare for the t-test
+control_indices <- which(col_data$condition == "Control")
+WT_indices <- which(col_data$condition == "WT")
+
+# Initialize a list to hold p-values
+p_values <- numeric(nrow(data_matrix))
+
+# Perform t-tests for each protein
+for (i in 1:nrow(data_matrix)) {
+  t_test_result <- t.test(data_matrix[i, control_indices], data_matrix[i, WT_indices], var.equal = TRUE)
+  p_values[i] <- t_test_result$p.value
+}
+
+# Create a data frame with results
+results <- data.frame(
+  ProteinID = data_unique$ProteinID,
+  p_value = p_values
+)
+
+# Adjust p-values for multiple testing (e.g., using Benjamini-Hochberg method)
+results$adj_p_value <- p.adjust(results$p_value, method = "BH")
+
+# Filter to get top 150 proteins based on adjusted p-values
+top_proteins <- results %>%
+  arrange(adj_p_value) %>%
+  head(150)
+
+# View the top 150 proteins
+head(top_proteins)
+
+
+
+# Get ProteinID from data_unique
+protein_ids <- data_unique$ProteinID
+
+# Rename data_matrix to data_matrix_ID
+data_matrix_ID <- data_matrix
+
+# Set the rownames
+rownames(data_matrix_ID) <- protein_ids
+
+
+# Load necessary libraries
+library(pheatmap)
+
+# Extract the expression matrix for the top 150 proteins
+top_protein_ids <- top_proteins$ProteinID
+top_protein_matrix <- data_matrix_ID[top_protein_ids, ]
+
+# Replace NA values with the mean of each column (optional)
+top_protein_matrix[is.na(top_protein_matrix)] <- rowMeans(top_protein_matrix, na.rm = TRUE)
+
+# Calculate the correlation matrix
+cor_matrix <- cor(top_protein_matrix, use = "pairwise.complete.obs")
+
+# Create a heatmap of the correlation matrix
+pheatmap(cor_matrix,
+         cluster_rows = TRUE,  # Cluster proteins
+         cluster_cols = TRUE,  # Cluster proteins
+         show_rownames = TRUE,  # Show protein names
+         show_colnames = TRUE,  # Show protein names
+         main = "Correlation Heatmap of Top 150 Proteins",
+         fontsize = 10,  # Font size for labels
+         fontsize_row = 8,  # Font size for row labels
+         fontsize_col = 8)  # Font size for column labels
+
+```
+
+```{r}
+# Load necessary libraries
+# library(pheatmap)
+
+# Replace NA values with the mean of each column (optional)
+top_protein_matrix[is.na(top_protein_matrix)] <- rowMeans(top_protein_matrix, na.rm = TRUE)
+
+# Create a heatmap of the expression matrix for the top 150 proteins
+pheatmap(top_protein_matrix,
+         cluster_rows = TRUE,  # Cluster proteins
+         cluster_cols = TRUE,  # Cluster samples
+         show_rownames = TRUE,  # Show protein names
+         show_colnames = TRUE,  # Show sample names
+         main = "Heatmap of Top 150 Proteins",
+         fontsize = 10,  # Font size for labels
+         fontsize_row = 8,  # Font size for row labels
+         fontsize_col = 8)  # Font size for column labels
+
+```
+
+```{r}
+# Calculate log2 fold change
+log2_fold_changes <- apply(top_protein_matrix, 1, function(x) {
+  log2(mean(x[experimental_design$condition == "WT"]) / mean(x[experimental_design$condition == "Control"]))
+})
+
+# Calculate p-values
+p_values <- apply(top_protein_matrix, 1, function(x) {
+  t.test(x[experimental_design$condition == "Control"], 
+         x[experimental_design$condition == "WT"])$p.value
+})
+
+# Calculate log-transformed p-values
+log_p_values <- -log10(p_values)
+
+# Create a data frame containing log2 fold change and log10 p-values
+results <- data.frame(
+  log2FoldChange = log2_fold_changes,
+  negLog10PValue = log_p_values
+)
+
+# Plot the volcano plot
+ggplot(results, aes(x = log2FoldChange, y = negLog10PValue)) +
+  geom_point(aes(color = negLog10PValue > -log10(0.05)), alpha = 0.5) +
+  scale_color_manual(values = c("gray", "red")) +
+  labs(title = "Volcano Plot",
+       x = "Log2 Fold Change",
+       y = "-Log10 P Value") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  # Add solid line at x=0
+  geom_vline(xintercept = 0, linetype = "solid", color = "black") +
+  # Add Control and WT labels below the plot
+  annotate("text", x = -0.5, y = -1, label = "Control", size = 4, color = "black") +
+  annotate("text", x = 0.5, y = -1, label = "WT", size = 4, color = "black")
+
+```
+
+#### This volcano plot provides a visual way to analyze changes in gene expression, clearly showing that the protein expressions of the control group and WT are indeed divided into two groups.<br><br>
+
+
+# Problem 2
+
+
+```{r}
+transcript = top_proteins$ProteinID
+ 
+# Create a data frame containing all required fields
+DE.data <- data.frame(
+  row.names = rownames(top_protein_matrix), 
+  logFC = log2_fold_changes,
+  p.value = p_values,
+  transcript = transcript
+)
+
+library(EnrichmentBrowser)
+library(org.Hs.eg.db)
+
+# Use the mapIds function for transfering
+gene_names <- mapIds(org.Hs.eg.db, 
+                          keys = DE.data$transcript, 
+                          column = "SYMBOL", 
+                          keytype = "UNIPROT", 
+                          multiVals = "first")
+
+# Add gene_names to DE.data
+DE.data$Symbol <- gene_names
+
+# View DE.data
+# print(DE.data)
+
+
+
+# Read the kgXref file
+kgXref = read.table("kgXref.txt.gz", sep="\t", as.is=T, comment="", header=F, quote="")
+
+# Set column names for the kgXref data frame
+colnames(kgXref) <- c("X.kgID", "mRNA", "spID", "spDisplayID", "geneSymbol", "refseq", "protAcc", "description", "rfamAcc", "tRnaName")
+
+# Read the human HPRD (Human Protein Reference Database) P2P (Protein-Protein) interaction file
+hprd = read.table("humanHprdP2P.txt.gz", as.is=T, header=F, comment="")
+
+# Set column names for the HPRD data frame
+colnames(hprd) <- c("X.query", "target", "distance")
+
+# Merge the HPRD data with kgXref using the query protein ID
+hprd.gs = merge(hprd, kgXref, by.x="X.query", by.y="X.kgID")[, c(1:3, 7)]
+colnames(hprd.gs) = c("query", "target", "distance", "q.symbol")
+
+# Merge again to get the target protein symbols
+hprd.gs = merge(hprd.gs, kgXref, by.x="target", by.y="X.kgID")[, c(1:4, 8)]
+colnames(hprd.gs) = c("target", "query", "distance", "q.symbol", "t.symbol")
+
+# Filter for edges with a distance of 1 (direct interactions)
+hprd.gs.1 = hprd.gs[hprd.gs$distance == 1, c("q.symbol", "t.symbol")]
+
+# Sort the pairs and remove duplicates
+hprd.gs.1 = as.data.frame(t(apply(hprd.gs.1, 1, sort)), stringsAsFactors=F)
+hprd.gs.1 = unique(hprd.gs.1)
+
+# Set column names for the filtered data
+colnames(hprd.gs.1) = c("from", "to")
+
+# Get the top differentially expressed genes based on p-value
+top.de.genes = unique(DE.data$Symbol[order(DE.data$p.value[1:150])])
+
+# Create a subnet of interactions where both proteins are in the top differentially expressed genes
+subnet = hprd.gs.1[hprd.gs.1$from %in% top.de.genes & hprd.gs.1$to %in% top.de.genes, ]
+
+# Assign a weight of 1 to each edge (required for graphBAM)
+subnet$weight = 1 
+
+# Create a graph from the subnet data
+G.de = graphBAM(subnet)
+
+# Plot the graph with specified attributes (e.g., node font size)
+plot(G.de, attrs=list(node=list(fontsize=60))) # passing attrs directly
+```
+
+#### From the PPI chart, it can be seen that proteins are mainly divided into six groups. These six groups interact with each other, and some proteins, like MCM4 and TOP1, also interact with themselves. Such pathway diagrams may indicate the presence of protein dimers. In the case of MCM4, two identical MCM4 molecules bind together to form a functional complex. The formation of dimers is a key step in initiating the DNA replication process. MCM dimers can bind to the origin of DNA, forming the core of the replication machinery. In addition to the functions mentioned above, the formation of dimers also enhances the stability of MCM proteins, ensuring their activity is maintained within the cell.
+
+```{r}
+# Get top differentially expressed genes from DE.data
+top_de_genes <- unique(DE.data$Symbol[order(DE.data$p.value)[1:150]])
+
+# Create a table containing interacting proteins, fold changes, and p-values
+interaction_table <- data.frame(
+  from = character(),
+  to = character(),
+  log2FC_from = numeric(),
+  log2FC_to = numeric(),
+  p_value_from = numeric(),
+  p_value_to = numeric()
+)
+
+# Iterate through the interactions in subnet
+for (i in 1:nrow(subnet)) {
+  from_gene <- subnet$from[i]
+  to_gene <- subnet$to[i]
+  
+  # If both genes are in the top differentially expressed genes
+  if (from_gene %in% top_de_genes && to_gene %in% top_de_genes) {
+    from_log2fc <- DE.data$logFC[DE.data$Symbol == from_gene]
+    to_log2fc <- DE.data$logFC[DE.data$Symbol == to_gene]
+    from_pvalue <- DE.data$p.value[DE.data$Symbol == from_gene]
+    to_pvalue <- DE.data$p.value[DE.data$Symbol == to_gene]
+    
+    # Add a row to the interaction_table
+    interaction_table <- rbind(interaction_table, data.frame(
+      from = from_gene,
+      to = to_gene,
+      log2FC_from = from_log2fc,
+      log2FC_to = to_log2fc,
+      p_value_from = from_pvalue,
+      p_value_to = to_pvalue
+    ))
+  }
+}
+
+# Remove rows with NA values from interaction_table
+interaction_table <- interaction_table[complete.cases(interaction_table), ]
+
+# Display the interaction_table
+head(interaction_table)
+```
+
+#### logFC (log2 Fold Change) represents the expression change fold of a gene under two conditions. The p-value indicates the significance of the expression change. Gene pairs with larger logFC and smaller p-values are likely to have more important and significant interactions.
+#### The table shows that the logFC values do not change much for most gene pairs. However, a few gene pairs like FUS-SFPQ, ECM1-RERE, HNRNPK-PCBP2, and ERH-HSPA8 have relatively larger logFC values, indicating their expression changes are more significant and they may be involved in important biological processes.
+#### What factors may influence their ability to interact?
+#### Factors like pH value, ion concentration, phosphorylation, glycosylation, and other modifications can change the function and interaction ability of proteins.
+#### The regulation of gene expression, such as transcription factor control and epigenetic modifications, can also affect the expression level of proteins, thereby influencing their interactions.
+#### Proteins often participate in complex signaling pathways, and the activation state of each gene in the pathway can also affect the interactions between proteins.
+
+
+# Problem 3
+
+
+```{r}
+# Extract component from interaction_table
+component_genes <- unique(interaction_table$from)  
+component_genes
+
+top_entrez_ids <- AnnotationDbi::select(org.Hs.eg.db, 
+                     keys = component_genes, 
+                     column = "ENTREZID", 
+                     keytype = "SYMBOL", 
+                     multiVals = "first")
+
+
+# library(reactome.db)  
+# library(org.Hs.eg.db)
+
+# Obtain the PATH ID of the gene from SYMBOL
+pathway_annotations <- AnnotationDbi::select(org.Hs.eg.db, 
+                     keys = component_genes, 
+                     column = "PATH", 
+                     keytype = "SYMBOL", 
+                     multiVals = "first")
+
+# Extract only PATH ID
+pathway_annotations <- unname(pathway_annotations)
+
+# Remove NA values
+pathway_annotations <- na.omit(pathway_annotations)
+
+# Assign column names
+colnames(pathway_annotations) <- c("Symbol", "PATH")
+head(pathway_annotations)
+
+
+# Count occurrences of each pathway name
+pathway_count <- table(pathway_annotations$PATH)
+pathway_count
+
+# Extract pathway names 
+pathway_names <- names(pathway_count)
+# pathway_names
+
+
+# Get all Entrez IDs for each pathway from reactome.db
+# library(reactome.db)
+allpathway_entrezid <- list()
+
+# Use select() to obtain the Entrez ID for each pathway.
+for (pathway in pathway_names) {
+    # Obtain all EntrezID of each pathway
+    entrez_ids <- AnnotationDbi::select(org.Hs.eg.db, 
+                                         keys = pathway, 
+                                         keytype = "PATH", 
+                                         columns = "ENTREZID")
+    
+    # Store result
+    allpathway_entrezid[[pathway]] <- entrez_ids$ENTREZID
+}
+
+# View allpathway_entrezid
+# head(allpathway_entrezid)
+
+
+
+# Obtain all Entrez IDs for sample genes
+all_sample_genes <- AnnotationDbi::select(org.Hs.eg.db,
+                                     keys = data_unique$GeneSymbol,
+                                     column = "ENTREZID",
+                                     keytype = "SYMBOL")$ENTREZID
+
+# Convert all_sample_genes to unique values
+all_sample_genes <- unique(all_sample_genes)
+# all_sample_genes
+
+# Calculate the total number of genes N
+total_sample_genes <- length(unique(all_sample_genes))
+
+
+# Get all annotated gene IDs
+N <- keys(org.Hs.eg.db, keytype = "ENTREZID")
+
+# Calculate the number of all annotated genes
+N <- length(unique(N))
+
+total.cnt <- total_sample_genes  # Total number of sample genes
+n.selected.cnt <- length(DE.data$transcript)  # Size of selected Top 150 proteins
+n.overlap <- length(top_entrez_ids$SYMBOL)  # Number of genes with annotations in the sample
+
+
+N
+total.cnt
+n.selected.cnt
+n.overlap
+
+```
+
+
+```{r}
+# Initialize the results data frame
+enrichment_results <- data.frame(PATHWAY = character(),
+                                  N.COMP = integer(), # Number of genes in each pathway in the sample
+                                  N.ARRAY = integer(), # Total number of known genes in this pathway
+                                  P.VALUE = numeric(),
+                                  stringsAsFactors = FALSE)
+
+# Iterate over each pathway, calculate Fisher's test, and store the results
+for (pathway in pathway_names) {
+    # Get the Entrez IDs for the pathway
+    pathway_entrez_ids <- allpathway_entrezid[[pathway]]
+    
+    # Number of genes in the pathway
+    n_pathway_genes <- length(pathway_entrez_ids)  
+
+    # Number of genes in the sample
+    n_in_sample <- sum(top_entrez_ids$ENTREZID %in% pathway_entrez_ids)
+
+    # Number of genes not in the sample
+    n_not_in_sample <- n_pathway_genes - n_in_sample  
+
+    # Calculate the total number of annotated and unannotated genes in the universe
+    n_total_in_universe <- N  # Total number of genes in the gene pool
+    n_total_not_in_universe <- n_total_in_universe - total.cnt  # Number of unannotated genes
+
+    # Construct the contingency table
+    contingency_table <- matrix(c(n_in_sample, n_not_in_sample,
+                                   n.overlap - n_in_sample, 
+                                   n_total_not_in_universe - (n.selected.cnt - n_in_sample)), nrow = 2)
+    colnames(contingency_table) <- c("Annotated", "Not Annotated")
+    rownames(contingency_table) <- c("In Sample", "Not In Sample")
+    
+    # Perform Fisher's test
+    fisher_test_result <- fisher.test(contingency_table)
+
+    # Add the results to the data frame
+    enrichment_results <- rbind(enrichment_results, data.frame
+                                (PATHWAY = pathway,
+                                 N.COMP = n_in_sample,
+                                 N.ARRAY = n_pathway_genes,
+                                 P.VALUE = fisher_test_result$p.value))
+}
+
+# Display the final results
+head(enrichment_results)
+```
+
+
+```{r}
+# Check for results with P value greater than 0.05
+non_significant_results <- enrichment_results[enrichment_results$P.VALUE > 0.05, ]
+
+# Determine if there are any results meeting the condition
+if (nrow(non_significant_results) > 0) {
+    # There are results that meet the condition; you can add further processing here
+} else {
+    print("No p-values is greater than 0.05 found.")
+}
+
+```
+
+#### The Fisher test was successful, and the 30 pathways identified from the top 150 proteins all have significant P values. A significant p-value usually indicates sufficient evidence to reject the null hypothesis, suggesting that these active genes may play a key role under the specific conditions set in this article for WT.<br><br>
+
+
+# Problem 4 
+
+
+### Mathematical Principles of Over Representation Analysis
+#### Over Representation Analysis (ORA) is primarily used to assess whether certain genes are significantly expressed under specific biological conditions. Its mathematical foundation is mainly based on hypothesis testing, essentially creating an intersection between the genes of interest (differential genes) and background genes. It focuses on the number of common genes (K value) between the genes of interest and a specific gene set, and then uses Fisher's exact test or hypergeometric distribution to obtain a significant p-value.
+
+### Executing the Analysis Code
+#### First, identify the annotated pathway Entrez IDs among the top 150 proteins, and then use these IDs to find all genes related to that biological pathway, calculating the total number of genes in that pathway (n_pathway_genes). Next, calculate the number of observed genes in the sample (n_in_sample), which is a key indicator for assessing whether genes are overrepresented. A contingency table needs to be established to perform the Fisher test; this 2x2 table includes the number of genes in the sample and those not in the sample. Therefore, it is necessary to calculate the number of genes not in the sample (n_not_in_sample) to understand how many genes in that pathway were not observed. Additionally, find the total number of genes in the universe (n_total_in_universe and n_total_not_in_universe). Once this data is completed, a contingency table can be established for statistical testing. Finally, use the results from the Fisher test (fisher_test_result) to evaluate whether the distribution of observed genes in a specific pathway is significant, thereby deriving the biological significance of the genes.
+
+### Biological Significance
+#### Over Representation Analysis can help researchers derive biological significance from datasets. For instance, when certain genes show a significant increase in expression under certain conditions, this may indicate that these genes play important roles in the development of these organisms. By comparing these genes with known biological pathways, potential biological mechanisms or therapeutic targets can be further inferred.
+
+### Advantages
+#### The greatest advantage of ORA is that it is a commonly used enrichment analysis method for gene sets, with a solid statistical theoretical foundation, making it relatively reliable and suitable for the most significantly different genes.
+
+### Disadvantages
+#### 1. ORA assumes that genes are independent, which may overlook interactions and regulatory relationships between genes.
+#### 2. ORA is sensitive to sample size; small samples may lead to unstable statistical test results.
+#### 3. During the gene selection process, it is necessary to set a p-value or fold-change to identify genes that truly have "biological significance," but there are no standardized settings, leading to variability in results. This method may overlook differences in the contribution levels of each gene (e.g., genes with large expression differences may be more important), potentially resulting in important genes being misassessed.
+#### 4. Genes that do not show significant differences are often ignored, reducing detection sensitivity. In terms of the organism itself, this approach neglects the complex internal interactions, and each gene may play different roles in various biological processes; treating results equally may lead to inaccuracies.
+
+### Significance of Fold Change Values
+#### When the fold change values of certain genes increase in some pathways while decreasing in others, this may reflect interactions between different biological pathways. The activation of certain pathways may inhibit the activity of others, usually due to interactions in signal transduction or competition in metabolic pathways. Additionally, gene regulation may also influence this phenomenon. Certain transcription factors may have different regulatory roles in different pathways, leading to increased expression of genes in some cases while decreasing in others. The promoting or inhibiting effects of genes in different contexts (such as stress or nutritional status) depend on the cellular environment or state, which may also contribute to these changes.
+
+
+```{r}
+# record end time
+end_time <- Sys.time()
+
+# execution time
+execution_time <- end_time - start_time
+execution_time
+
+```
