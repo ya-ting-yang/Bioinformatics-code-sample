@@ -9,7 +9,7 @@ output: html_document
 start_time <- Sys.time()
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
 # Set working directory
-setwd("C:/Users/user/OneDrive/桌面/251RBIF-112-2 Mathematical Modeling for Bioinformatics/Week 8/Week 8 Assignment")
+setwd("C:/Users/user/..") # directory where file was downloaded
 library(data.table)
 library(makeunique)
 library(dplyr)
@@ -33,6 +33,7 @@ options(warn = -1)
 ```
 
 #### The data used in this coursework mainly comes from the article by Bressan, 2021. It focused on the highly malignant gliomas in human fetuses, and explained how H3.3 mutations affect the regional-specific neural progenitor cell state to drive the development of the disease. The study provided data from the following groups:
+#### The goal is to practice the concepts of statistical significance of interactions within groups of genes, correlation networks,and significantly enriched annotations.
 #### 1. Control: Healthy human fetal neural stem cells
 #### 2. G34R (Forebrain): Disease group, with a mutation in the H3.3 protein where glycine 34 is changed to arginine
 #### 3. WT: Disease group, with the unmutated H3.3 protein
