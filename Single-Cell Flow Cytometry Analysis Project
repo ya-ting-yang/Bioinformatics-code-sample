@@ -1,0 +1,405 @@
+---
+title: "Single-Cell Flow Cytometry Analysis Project"
+author: "Ya-Ting Yang"
+date: "2025-01-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(ggplot2)
+library(flowCore)
+library(flowStats)
+library(flowViz)
+library(platetools)
+library(MASS)
+```
+
+
+# Question 1
+## Do a simple QC: generate a plate plot for the number of cells in each well.
+
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+library(data.table)
+library(ggplot2)
+
+# locate the path
+sampleDir <- "C:/Users/user..."
+
+# read plateIndex
+annotation <- fread(file.path(sampleDir, "plateIndex.txt"))
+
+# extract the row (A–H) and column (1–12) from the name field
+annotation[, row := sub(".*\\.([A-H])\\d{2}$", "\\1", name)]
+annotation[, col := as.integer(sub(".*\\.[A-H](\\d{2})$", "\\1", name))]
+
+# generate well IDs like A01, A02...
+annotation[, well := paste0(row, sprintf("%02d", col))]
+
+# identify FCS files
+files <- list.files(sampleDir, full.names = TRUE)
+files <- files[!grepl("plateIndex", files)]
+
+# use read.FCS to count events (nrow(exprs()))
+get_well <- function(x) sub(".*\\.", "", basename(x))
+
+cell_count <- sapply(files, function(f) {
+  ff <- read.FCS(f, transformation = FALSE)
+  nrow(exprs(ff))
+})
+
+plateDF <- data.frame(
+  well = sapply(files, get_well),
+  CellCount = as.numeric(cell_count),
+  stringsAsFactors = FALSE
+)
+
+# merge with annotation (H06–H12 will naturally become NA)
+plateDF <- merge(annotation, plateDF, by = "well", all.x = TRUE)
+
+# plate plot
+plateDF$row <- factor(plateDF$row, levels = rev(LETTERS[1:8]))
+plateDF$col <- factor(plateDF$col, levels = 1:12)
+
+ggplot(plateDF, aes(x = col, y = row, fill = CellCount)) +
+  geom_tile(color = "black") +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Plate Plot: Cell Count") +
+  theme_minimal()
+
+```
+
+
+# Question 2.a 
+## Generate FSC-SSC scatterplot for the very first well in the dataset.
+
+
+```{r}
+library(flowCore)
+
+# attach file paths by matching wells
+plateDF$File <- files[match(plateDF$well, sapply(files, get_well))]
+
+# select the first well in the dataset with non-missing cell count
+first_well_row <- plateDF[!is.na(CellCount), ][1, ]
+first_file <- first_well_row$File
+first_well <- first_well_row$well
+
+ff_first <- read.FCS(first_file, transformation = FALSE)
+dat_first <- as.data.frame(exprs(ff_first))
+
+# check available channels
+colnames(dat_first)
+
+# use FSC-H and SSC-H
+fsc_col <- "FSC-H"
+ssc_col <- "SSC-H"
+
+ggplot(dat_first, aes_string(x = fsc_col, y = ssc_col)) +
+  geom_point(alpha = 0.3, size = 0.5) +
+  labs(
+    title = paste("FSC vs SSC - well", first_well),
+    x = fsc_col,
+    y = ssc_col
+  ) +
+  theme_minimal()
+
+```
+
+
+# Question 2.b 
+## Try finding the main cell population by using a fit with a single 2-D normal distribution. Use few scale factors, e.g. 1, 1.5, 2. Plot the results and comment on yourfindings. Does this simple gating procedure seem to be working well in this case? Would youtrust it?
+
+
+```{r}
+library(flowStats)
+library(flowCore)
+
+# build a norm2Filter using FSC-H and SSC-H
+nf <- norm2Filter("FSC-H", "SSC-H",
+                  filterId = "mainPop",
+                  scale.factor = 1.5)  # try scale factors: 1, 1.5, 2
+
+# apply the filter
+fres <- flowCore::filter(ff_first, nf)
+
+# extract events inside the gate
+in_gate <- fres@subSet
+ff_gate <- ff_first[in_gate, ]
+
+# convert to data frames for plotting
+dat_all  <- as.data.frame(exprs(ff_first))
+dat_gate <- as.data.frame(exprs(ff_gate))
+
+library(ggplot2)
+ggplot() +
+  geom_point(data = dat_all,
+             aes(x = `FSC-H`, y = `SSC-H`),
+             alpha = 0.2, size = 0.5, color = "grey") +
+  geom_point(data = dat_gate,
+             aes(x = `FSC-H`, y = `SSC-H`),
+             alpha = 0.5, size = 0.5, color = "red") +
+  labs(title = "norm2Filter Gate on FSC-H vs SSC-H") +
+  theme_minimal()
+
+```
+
+## norm2Filter() fits a 2-D Gaussian on the (FSC-H, SSC-H) population.
+
+## scale.factor controls the radius of the Mahalanobis ellipse:
+
+#### 1 → tight gate (only dense center population)
+
+#### 1.5 → moderate gate
+
+#### 2 → large gate (may include debris/outliers)
+
+
+
+```{r}
+# manual 2D normal fitting using Mahalanobis distance
+library(mvtnorm)
+
+# extract FSC-H and SSC-H
+xy <- dat_first[, c("FSC-H", "SSC-H")]
+
+# optional trimming to avoid extreme values affecting covariance
+trim_quant <- 0.005
+keep_idx <- apply(xy, 2, function(v) {
+  v >= quantile(v, trim_quant) & v <= quantile(v, 1 - trim_quant)
+})
+keep_idx <- keep_idx[, 1] & keep_idx[, 2]
+xy_trim <- xy[keep_idx, ]
+
+# estimate multivariate mean and covariance
+mu <- colMeans(xy_trim)
+Sigma <- cov(xy_trim)
+
+# compute Mahalanobis distance^2
+xy$D2 <- mahalanobis(xy, center = mu, cov = Sigma)
+
+# create grid for contour drawing
+x_seq <- seq(min(xy[["FSC-H"]]), max(xy[["FSC-H"]]), length.out = 100)
+y_seq <- seq(min(xy[["SSC-H"]]), max(xy[["SSC-H"]]), length.out = 100)
+grid <- expand.grid(`FSC-H` = x_seq, `SSC-H` = y_seq)
+grid$D2 <- mahalanobis(grid[, c("FSC-H", "SSC-H")],
+                       center = mu, cov = Sigma)
+
+scales <- c(1, 1.5, 2)
+levels_D2 <- scales^2
+
+ggplot() +
+  geom_point(data = xy, aes(x = `FSC-H`, y = `SSC-H`),
+             alpha = 0.3, size = 0.5) +
+  geom_contour(data = grid,
+               aes(x = `FSC-H`, y = `SSC-H`, z = D2),
+               breaks = levels_D2,
+               color = "red") +
+  labs(
+    title = paste("FSC-H vs SSC-H with 2D Normal Gating - well", first_well),
+    subtitle = paste("Mahalanobis scales:", paste(scales, collapse = ", ")),
+    x = "FSC-H",
+    y = "SSC-H"
+  ) +
+  theme_minimal()
+
+
+```
+
+## Does this simple gating procedure seem to be working well in this case? Would youtrust it?
+### Small-scale ellipses only capture the most densely packed cells in the center, while larger scales, although encompassing more cells, also begin to include debris or outliers at the edges. Therefore, a single 2D normal gate has limitations and cannot be fully trusted; it needs to be combined with other gating steps and expert interpretation.
+### This method is too simplistic for real gating and should be supplemented with FSC-A vs FSC-H doublet exclusion, SSC-W / FSC-W, debris filtering and fluorescence gating. <br><br><br>
+
+
+# Question 3.a Mock control (very first well in the dataset)
+
+
+```{r}
+library(flowCore)
+library(data.table)
+library(ggplot2)
+library(gridExtra)
+
+# build a small table mapping well -> file (if not already built)
+file_map <- data.frame(
+  File = files,
+  well = sapply(files, get_well),
+  stringsAsFactors = FALSE
+)
+
+# Merge file path into annotation (so we can find any well's file)
+annotation2 <- merge(annotation, file_map, by = "well", all.x = TRUE)
+
+
+# The "very first well" per instruction: use first non-NA CellCount or first annotation row
+# We'll pick the first row of annotation (it's mock per instructions)
+mock_row <- annotation2[1, ]
+mock_row
+
+# read the mock flowFrame
+ff_mock <- read.FCS(mock_row$File, transformation = FALSE)
+dat_mock <- as.data.frame(exprs(ff_mock))
+
+# detect FL1 and FL4 channels 
+chan_names <- colnames(dat_mock)
+fl1_name <- grep("^FL1-H", chan_names, ignore.case = TRUE, value = TRUE)[1]
+fl4_name <- grep("^FL4-H", chan_names, ignore.case = TRUE, value = TRUE)[1]
+
+chan_names
+fl1_name
+fl4_name
+
+# scatter plot for mock
+p_scatter_mock <- ggplot(dat_mock, aes_string(x = fl1_name, y = fl4_name)) +
+  geom_point(alpha = 0.3, size = 0.6) +
+  labs(title = paste0("Mock control: ", mock_row$well),
+       x = fl1_name,
+       y = fl4_name) +
+  theme_minimal()
+
+# histograms for FL1-H and FL4-H
+p_hist_fl1 <- ggplot(dat_mock, aes_string(x = fl1_name)) +
+  geom_histogram(bins = 80, fill = "lightblue", color = "black") +
+  labs(title = "Mock: FL1-H (YFP) histogram", x = "FL1-H intensity") +
+  theme_minimal()
+
+p_hist_fl4 <- ggplot(dat_mock, aes_string(x = fl4_name)) +
+  geom_histogram(bins = 80, fill = "pink", color = "black") +
+  labs(title = "Mock: FL4-H (Active Caspase) histogram", x = "FL4-H intensity") +
+  theme_minimal()
+
+
+# scatter plot
+plot(dat_mock[[fl1_name]], dat_mock[[fl4_name]],
+     xlab = fl1_name, ylab = fl4_name,
+     main = paste("Scatter:", mock_row$well),
+     pch = 20, col = rgb(0,0,0,0.2))
+
+# FL1 histogram
+hist(dat_mock[[fl1_name]], breaks = 80,
+     main = paste("Histogram:", fl1_name),
+     xlab = fl1_name, col = "lightblue")
+
+# FL4 histogram
+hist(dat_mock[[fl4_name]], breaks = 80,
+     main = paste("Histogram:", fl4_name),
+     xlab = fl4_name, col = "pink")
+
+```
+
+
+# Question 3.b Naive thresholds: T = mean + 2*sd (computed from mock control)
+
+
+```{r}
+fl1_vals <- dat_mock[[fl1_name]]
+fl4_vals <- dat_mock[[fl4_name]]
+
+T1 <- mean(fl1_vals, na.rm = TRUE) + 2 * sd(fl1_vals, na.rm = TRUE)
+T4 <- mean(fl4_vals, na.rm = TRUE) + 2 * sd(fl4_vals, na.rm = TRUE)
+
+cat(sprintf("\n3b Thresholds (mock): T1 (FL1) = %.3f ; T4 (FL4) = %.3f\n", T1, T4))
+```
+
+
+# Question 3.c replot scatter for mock with thresholds lines
+
+
+```{r}
+# ggplot2 scatter + thresholds
+ggplot(dat_mock, aes(x = `FL1-H`, y = `FL4-H`)) +
+  geom_point(alpha = 0.3, size = 0.6) +
+  geom_vline(xintercept = T1, color = "red", linetype = "dashed", size = 0.7) +
+  geom_hline(yintercept = T4, color = "red", linetype = "dashed", size = 0.7) +
+  labs(
+    title = paste0("Mock control: ", mock_row$well,
+                   " (FL1-H vs FL4-H with thresholds)"),
+    x = "FL1-H",
+    y = "FL4-H"
+  ) +
+  theme_minimal()
+
+```
+
+#### The bottom left corner, labeled "No YFP, No Activity," represents the location of most cells in the analog control, where we expected no YFP or high caspase activity. The top right corner is the most interesting region, where cells express YFP and simultaneously exhibit activated caspase signaling, both exceeding the mean observed in the analog control by 2 standard deviations.
+
+
+# 3.d Plot the FL1-H/FL4-H scatterplot for the well 6 (CIDE protein with YFP at the N-terminal)
+
+
+```{r}
+# find out the data of well 6
+well6_row <- annotation2[annotation2$wellnr == "6", ]  
+
+# read well 6 FCS file
+ff_w6 <- read.FCS(well6_row$File, transformation = FALSE)
+dat_w6 <- as.data.frame(exprs(ff_w6))
+
+# scatter plot (well 6) + Thresholds
+ggplot(dat_w6, aes(x = `FL1-H`, y = `FL4-H`)) +
+  geom_point(alpha = 0.25, size = 0.6) +
+  geom_vline(xintercept = T1, color = "red", linetype = "dashed", size = 0.8) +
+  geom_hline(yintercept = T4, color = "red", linetype = "dashed", size = 0.8) +
+  labs(
+    title = paste0("CIDE-Y (well 6): ", fl1_name, " vs ", fl4_name),
+    subtitle = "With thresholds derived from Mock control",
+    x = fl1_name,
+    y = fl4_name
+  ) +
+  theme_minimal()
+
+
+# compute gating: transfected / caspase-induced
+# extract FL1-H (YFP) and FL4-H (active caspase) values
+fl1_vals <- dat_w6[[fl1_name]]     # FL1 channel intensities for this well
+fl4_vals <- dat_w6[[fl4_name]]     # FL4 channel intensities for this well
+
+# apply gating thresholds:
+# T1 = fluorescence cutoff for transfection (YFP+)
+# T4 = fluorescence cutoff for caspase activation (Caspase+)
+is_transfected <- fl1_vals > T1    # TRUE = YFP-positive
+is_caspase <- fl4_vals > T4        # TRUE = Caspase-positive
+
+# double-positive gate (both transfected and caspase activated)
+is_doublepos <- is_transfected & is_caspase
+
+# count events and compute percentages
+# Total number of cells
+n_total <- length(fl1_vals)       
+# Number of transfected (YFP+) cells
+n_transfected <- sum(is_transfected)      
+# Number of caspase-induced among YFP+
+n_doublepos <- sum(is_doublepos)              
+
+# Percent transfected out of total cells
+pct_transfected <- n_transfected / n_total * 100
+
+# Percent caspase-positive among only the transfected population
+pct_double_of_transfected <- n_doublepos / n_transfected * 100
+
+# Print summary
+cat(sprintf("\nWell 6 (CIDE-Y):\n"))
+cat(sprintf("Total cells = %d\n", n_total))
+cat(sprintf("Transfected (FL1 > T1) = %d (%.2f%%)\n",
+            n_transfected, pct_transfected))
+cat(sprintf(
+  "Caspase-induced among transfected = %d (%.2f%% of transfected)\n",
+  n_doublepos, pct_double_of_transfected
+))
+```
+
+
+
+
+
+
+
+
+
+
+
